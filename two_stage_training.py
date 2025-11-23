@@ -64,20 +64,37 @@ class RoPE(nn.Module):
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         t = torch.arange(max_len).float()
         freqs = torch.outer(t, inv_freq)
-        # (max_len, dim/2) -> (max_len, dim) via complex
+        # freqs shape: (max_len, dim/2)
+        # 我们在这里生成 cos/sin，但在 forward 里需要扩展维度
         self.register_buffer("cos_cached", freqs.cos())
         self.register_buffer("sin_cached", freqs.sin())
 
     def forward(self, q, k):
         # q, k: (B, Seq, Heads, HeadDim)
         seq_len = q.shape[1]
-        cos = self.cos_cached[:seq_len, :].unsqueeze(0).unsqueeze(2)
-        sin = self.sin_cached[:seq_len, :].unsqueeze(0).unsqueeze(2)
         
+        # 截取当前序列长度
+        # shape: (seq_len, dim/2)
+        cos = self.cos_cached[:seq_len, :]
+        sin = self.sin_cached[:seq_len, :]
+        
+        # 扩展维度以匹配 (B, S, Heads, HeadDim)
+        # 1. 增加 Batch 和 Heads 维度 -> (1, S, 1, dim/2)
+        cos = cos.unsqueeze(0).unsqueeze(2)
+        sin = sin.unsqueeze(0).unsqueeze(2)
+        
+        # === 修复点: 复制 cos/sin 以匹配全维度 ===
+        # 因为 rotate_half 将向量分为前后两半，它们共享同一组频率
+        # cat 后 shape 变为: (1, S, 1, dim)
+        cos = torch.cat((cos, cos), dim=-1)
+        sin = torch.cat((sin, sin), dim=-1)
+
         def rotate_half(x):
+            # 将 x 分割为两半: (..., dim/2)
             x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
             return torch.cat((-x2, x1), dim=-1)
 
+        # 现在 cos/sin 的最后一维与 q 相同，可以相乘
         q_embed = (q * cos) + (rotate_half(q) * sin)
         k_embed = (k * cos) + (rotate_half(k) * sin)
         return q_embed, k_embed
